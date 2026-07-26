@@ -390,14 +390,26 @@ func bridgeConnection(state *connState, publicConn net.Conn, publicPort int) {
 	defer ch.Close()
 	go ssh.DiscardRequests(reqs)
 
-	done := make(chan struct{}, 2)
+	// 双方向コピー。片方向がEOFに達しても、相手方向がまだデータを
+	// 送信中の可能性があるため、即座に両方を完全クローズしない。
+	// 半クローズ(CloseWrite)で「これ以上送らない」ことだけを伝え、
+	// 両方向が終わってから最後にまとめて閉じる。
+	// (これをやらないと、未送信/未読データが残ったソケットをCloseした際に
+	//  OSがRST(強制リセット)を送ってしまい、Minecraftクライアント側で
+	//  "Connection reset" として表示される)
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		io.Copy(ch, publicConn)
-		done <- struct{}{}
+		ch.CloseWrite()
 	}()
 	go func() {
+		defer wg.Done()
 		io.Copy(publicConn, ch)
-		done <- struct{}{}
+		if tcpConn, ok := publicConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 	}()
-	<-done
+	wg.Wait()
 }
