@@ -1,0 +1,9 @@
+{
+  "users": [
+    {
+      "username": "asahi",
+      "public_key": "ssh-ed25519 AAAA... user@ezst-client",
+      "port": 0
+    }
+  ]
+}
