@@ -198,10 +198,11 @@ type forwardedTCPPayload struct {
 // ---------- 接続ごとの状態 ----------
 
 type connState struct {
-	username string
-	sconn    *ssh.ServerConn
-	listener net.Listener // このユーザーが公開しているポートのlistener(1接続につき1つまで)
-	mu       sync.Mutex
+	username    string
+	sconn       *ssh.ServerConn
+	listener    net.Listener // このユーザーが公開しているポートのlistener(1接続につき1つまで)
+	forwardAddr string       // クライアントがtcpip-forwardで要求した元のアドレス文字列(空文字含む)
+	mu          sync.Mutex
 }
 
 func main() {
@@ -323,6 +324,10 @@ func handleTCPIPForward(state *connState, req *ssh.Request, users *UserStore) {
 	}
 
 	state.mu.Lock()
+	state.forwardAddr = msg.Addr
+	state.mu.Unlock()
+
+	state.mu.Lock()
 	if state.listener != nil {
 		// 既に公開中。1ユーザー1リスナーのみ許可(多重公開は禁止)
 		state.mu.Unlock()
@@ -375,8 +380,12 @@ func bridgeConnection(state *connState, publicConn net.Conn, publicPort int) {
 	var origPort uint32
 	fmt.Sscanf(origPortStr, "%d", &origPort)
 
+	state.mu.Lock()
+	addr := state.forwardAddr
+	state.mu.Unlock()
+
 	payload := forwardedTCPPayload{
-		Addr:       "0.0.0.0",
+		Addr:       addr,
 		Port:       uint32(publicPort),
 		OriginAddr: origHost,
 		OriginPort: origPort,
