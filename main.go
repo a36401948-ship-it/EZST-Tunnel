@@ -397,19 +397,24 @@ func bridgeConnection(state *connState, publicConn net.Conn, publicPort int) {
 	// (これをやらないと、未送信/未読データが残ったソケットをCloseした際に
 	//  OSがRST(強制リセット)を送ってしまい、Minecraftクライアント側で
 	//  "Connection reset" として表示される)
+	log.Printf("チャンネル開設成功: user=%s remote=%s", state.username, publicConn.RemoteAddr())
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(ch, publicConn)
+		n, err := io.Copy(ch, publicConn)
+		log.Printf("client->local: %d bytes, err=%v (user=%s)", n, err, state.username)
 		ch.CloseWrite()
 	}()
 	go func() {
 		defer wg.Done()
-		io.Copy(publicConn, ch)
+		n, err := io.Copy(publicConn, ch)
+		log.Printf("local->client: %d bytes, err=%v (user=%s)", n, err, state.username)
 		if tcpConn, ok := publicConn.(*net.TCPConn); ok {
 			tcpConn.CloseWrite()
 		}
 	}()
 	wg.Wait()
+	log.Printf("ブリッジ終了: user=%s", state.username)
 }
