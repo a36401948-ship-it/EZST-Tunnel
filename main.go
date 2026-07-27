@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
@@ -20,8 +21,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -30,6 +33,7 @@ import (
 
 type Config struct {
 	SSHListen   string `json:"ssh_listen"`
+	HTTPListen  string `json:"http_listen"` // 空文字なら登録APIを起動しない
 	HostKeyPath string `json:"host_key_path"`
 	UsersFile   string `json:"users_file"`
 	PortPoolMin int    `json:"port_pool_min"`
@@ -157,6 +161,57 @@ func (us *UserStore) AssignedPort(username string) (int, error) {
 	return 0, fmt.Errorf("空きポートがありません(pool %d-%d)", us.poolMin, us.poolMax)
 }
 
+// RegisterOrGet は公開鍵から自動登録する。
+// 既に同じ公開鍵が登録済みならそのユーザー名を返す(冪等)。
+// 未登録なら自動生成したユーザー名で新規登録する。
+func (us *UserStore) RegisterOrGet(pubKey ssh.PublicKey) (username string, isNew bool, err error) {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
+	keyStr := string(pubKey.Marshal())
+	if idx, ok := us.byKeyStr[keyStr]; ok {
+		return us.entries[idx].Username, false, nil
+	}
+
+	// 衝突しないユーザー名を生成(4バイトの乱数、"u-"接頭辞)
+	var newName string
+	for i := 0; i < 10; i++ {
+		buf := make([]byte, 4)
+		if _, err := rand.Read(buf); err != nil {
+			return "", false, err
+		}
+		candidate := "u-" + hex.EncodeToString(buf)
+		exists := false
+		for _, e := range us.entries {
+			if e.Username == candidate {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			newName = candidate
+			break
+		}
+	}
+	if newName == "" {
+		return "", false, fmt.Errorf("ユーザー名の生成に失敗しました")
+	}
+
+	authKeyLine := string(ssh.MarshalAuthorizedKey(pubKey))
+	us.entries = append(us.entries, UserEntry{
+		Username:  newName,
+		PublicKey: authKeyLine[:len(authKeyLine)-1], // 末尾の改行を除去
+		Port:      0,
+	})
+	us.byKeyStr[keyStr] = len(us.entries) - 1
+
+	if err := us.save(); err != nil {
+		// メモリ上のentriesは追加済みだが保存に失敗。呼び出し側にエラーを返す。
+		return "", false, err
+	}
+	return newName, true, nil
+}
+
 // ---------- ホスト鍵 ----------
 
 func loadOrCreateHostKey(path string) (ssh.Signer, error) {
@@ -175,6 +230,103 @@ func loadOrCreateHostKey(path string) (ssh.Signer, error) {
 	}
 	log.Printf("新しいホスト鍵を生成しました: %s", path)
 	return ssh.ParsePrivateKey(pemBytes)
+}
+
+// ---------- 登録API(HTTP) ----------
+
+type rateLimiter struct {
+	mu       sync.Mutex
+	attempts map[string][]time.Time
+	limit    int
+	window   time.Duration
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	return &rateLimiter{attempts: map[string][]time.Time{}, limit: limit, window: window}
+}
+
+func (r *rateLimiter) Allow(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-r.window)
+	var kept []time.Time
+	for _, t := range r.attempts[key] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= r.limit {
+		r.attempts[key] = kept
+		return false
+	}
+	r.attempts[key] = append(kept, now)
+	return true
+}
+
+type registerRequest struct {
+	PublicKey string `json:"public_key"`
+}
+
+type registerResponse struct {
+	Username string `json:"username"`
+	SSHHost  string `json:"ssh_host,omitempty"`
+	SSHPort  int    `json:"ssh_port,omitempty"`
+	IsNew    bool   `json:"is_new"`
+}
+
+func startRegistrationServer(cfg *Config, users *UserStore) {
+	limiter := newRateLimiter(5, time.Hour) // 同一IPから1時間に5回まで
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+
+		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if !limiter.Allow(clientIP) {
+			http.Error(w, "登録リクエストが多すぎます。しばらく待ってから再試行してください", http.StatusTooManyRequests)
+			return
+		}
+
+		var req registerRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
+			http.Error(w, "リクエストの形式が不正です", http.StatusBadRequest)
+			return
+		}
+
+		pubKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(req.PublicKey))
+		if err != nil {
+			http.Error(w, "公開鍵の形式が不正です(ssh-ed25519形式を送ってください)", http.StatusBadRequest)
+			return
+		}
+		if pubKey.Type() != ssh.KeyAlgoED25519 {
+			http.Error(w, "ed25519形式の公開鍵のみ受け付けています", http.StatusBadRequest)
+			return
+		}
+
+		username, isNew, err := users.RegisterOrGet(pubKey)
+		if err != nil {
+			log.Printf("登録エラー: %v", err)
+			http.Error(w, "登録処理に失敗しました", http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("登録API: user=%s isNew=%v remote=%s", username, isNew, clientIP)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(registerResponse{
+			Username: username,
+			IsNew:    isNew,
+		})
+	})
+
+	log.Printf("登録API起動: %s", cfg.HTTPListen)
+	if err := http.ListenAndServe(cfg.HTTPListen, mux); err != nil {
+		log.Fatalf("登録APIの起動に失敗: %v", err)
+	}
 }
 
 // ---------- RFC4254 メッセージ ----------
@@ -240,6 +392,10 @@ func main() {
 		log.Fatalf("リッスンに失敗 (%s): %v", cfg.SSHListen, err)
 	}
 	log.Printf("SSHトンネルサーバー起動: %s", cfg.SSHListen)
+
+	if cfg.HTTPListen != "" {
+		go startRegistrationServer(cfg, users)
+	}
 
 	for {
 		nConn, err := listener.Accept()
