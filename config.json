@@ -1,7 +1,8 @@
 {
   "ssh_listen": ":2222",
+  "http_listen": ":8080",
   "host_key_path": "host_key.pem",
   "users_file": "users.json",
-  "port_pool_min": 25500,
-  "port_pool_max": 25600
+  "port_pool_min": 20000,
+  "port_pool_max": 30000
 }

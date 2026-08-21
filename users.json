@@ -1,0 +1,19 @@
+{
+  "users": [
+    {
+      "username": "asahi",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKsWNEuoQPABgS4hzok7V31j8nUvSsk40iWZbIGYSJDF asahi",
+      "port": 25500
+    },
+    {
+      "username": "u-c24a6b4d",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINZGfp1ALSjaKZX0gyfRZI14a3p++rQWWzsb10N4nsJc",
+      "port": 25501
+    },
+    {
+      "username": "u-06f0953e",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMeEb98rjfDnOwlwQypvYPHgc7EksdJ1rq/KkBCrZ8qK",
+      "port": 25502
+    }
+  ]
+}

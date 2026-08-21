@@ -31,6 +31,10 @@ import (
 
 // ---------- 設定 ----------
 
+// フリー枠(プロダクトキー未設定)の月間転送量上限
+const bytesPerGB = 1024 * 1024 * 1024
+const freeTierMonthlyLimitBytes int64 = 1 * bytesPerGB
+
 type Config struct {
 	SSHListen   string `json:"ssh_listen"`
 	HTTPListen  string `json:"http_listen"` // 空文字なら登録APIを起動しない
@@ -64,9 +68,12 @@ func loadConfig(path string) (*Config, error) {
 // ---------- ユーザー管理 ----------
 
 type UserEntry struct {
-	Username  string `json:"username"`
-	PublicKey string `json:"public_key"` // "ssh-ed25519 AAAA... comment" 形式
-	Port      int    `json:"port"`       // 0なら次回接続時に自動割当てして保存する
+	Username   string `json:"username"`
+	PublicKey  string `json:"public_key"`            // "ssh-ed25519 AAAA... comment" 形式
+	Port       int    `json:"port"`                  // 0なら次回接続時に自動割当てして保存する
+	ProductKey string `json:"product_key,omitempty"` // 空ならフリー枠(月間1GB)扱い
+	BytesUsed  int64  `json:"bytes_used"`            // UsageMonth中の累計転送バイト数(上り+下り合算)
+	UsageMonth string `json:"usage_month,omitempty"` // "2006-01" 形式。月が変わったらリセットされる
 }
 
 type UsersFile struct {
@@ -161,15 +168,69 @@ func (us *UserStore) AssignedPort(username string) (int, error) {
 	return 0, fmt.Errorf("空きポートがありません(pool %d-%d)", us.poolMin, us.poolMax)
 }
 
+// IsOverLimit はフリー枠ユーザーが当月の上限(1GB)を超えているか判定する。
+// プロダクトキー保持ユーザーは常にfalse(無制限)。
+func (us *UserStore) IsOverLimit(username string) bool {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+	for i := range us.entries {
+		if us.entries[i].Username != username {
+			continue
+		}
+		if us.entries[i].ProductKey != "" {
+			return false
+		}
+		if us.entries[i].UsageMonth != currentUsageMonth() {
+			return false // 新しい月にはまだ入っていないので0扱い
+		}
+		return us.entries[i].BytesUsed >= freeTierMonthlyLimitBytes
+	}
+	return false
+}
+
+// AddUsage は転送済みバイト数を加算する。月が変わっていればリセットしてから加算する。
+func (us *UserStore) AddUsage(username string, n int64) {
+	if n <= 0 {
+		return
+	}
+	us.mu.Lock()
+	defer us.mu.Unlock()
+	for i := range us.entries {
+		if us.entries[i].Username != username {
+			continue
+		}
+		month := currentUsageMonth()
+		if us.entries[i].UsageMonth != month {
+			us.entries[i].UsageMonth = month
+			us.entries[i].BytesUsed = 0
+		}
+		us.entries[i].BytesUsed += n
+		if err := us.save(); err != nil {
+			log.Printf("使用量保存エラー user=%s: %v", username, err)
+		}
+		return
+	}
+}
+
+func currentUsageMonth() string {
+	return time.Now().Format("2006-01")
+}
+
 // RegisterOrGet は公開鍵から自動登録する。
-// 既に同じ公開鍵が登録済みならそのユーザー名を返す(冪等)。
-// 未登録なら自動生成したユーザー名で新規登録する。
-func (us *UserStore) RegisterOrGet(pubKey ssh.PublicKey) (username string, isNew bool, err error) {
+// 既に同じ公開鍵が登録済みならそのユーザー名を返す(冪等)。未登録なら自動生成したユーザー名で新規登録する。
+// productKeyが空でなければ、そのユーザーをプロダクトキー保持(無制限枠)として記録/更新する。
+func (us *UserStore) RegisterOrGet(pubKey ssh.PublicKey, productKey string) (username string, isNew bool, err error) {
 	us.mu.Lock()
 	defer us.mu.Unlock()
 
 	keyStr := string(pubKey.Marshal())
 	if idx, ok := us.byKeyStr[keyStr]; ok {
+		if productKey != "" && us.entries[idx].ProductKey != productKey {
+			us.entries[idx].ProductKey = productKey
+			if err := us.save(); err != nil {
+				return "", false, err
+			}
+		}
 		return us.entries[idx].Username, false, nil
 	}
 
@@ -199,9 +260,10 @@ func (us *UserStore) RegisterOrGet(pubKey ssh.PublicKey) (username string, isNew
 
 	authKeyLine := string(ssh.MarshalAuthorizedKey(pubKey))
 	us.entries = append(us.entries, UserEntry{
-		Username:  newName,
-		PublicKey: authKeyLine[:len(authKeyLine)-1], // 末尾の改行を除去
-		Port:      0,
+		Username:   newName,
+		PublicKey:  authKeyLine[:len(authKeyLine)-1], // 末尾の改行を除去
+		Port:       0,
+		ProductKey: productKey,
 	})
 	us.byKeyStr[keyStr] = len(us.entries) - 1
 
@@ -265,7 +327,8 @@ func (r *rateLimiter) Allow(key string) bool {
 }
 
 type registerRequest struct {
-	PublicKey string `json:"public_key"`
+	PublicKey  string `json:"public_key"`
+	ProductKey string `json:"product_key,omitempty"`
 }
 
 type registerResponse struct {
@@ -307,7 +370,7 @@ func startRegistrationServer(cfg *Config, users *UserStore) {
 			return
 		}
 
-		username, isNew, err := users.RegisterOrGet(pubKey)
+		username, isNew, err := users.RegisterOrGet(pubKey, req.ProductKey)
 		if err != nil {
 			log.Printf("登録エラー: %v", err)
 			http.Error(w, "登録処理に失敗しました", http.StatusInternalServerError)
@@ -354,6 +417,7 @@ type connState struct {
 	sconn       *ssh.ServerConn
 	listener    net.Listener // このユーザーが公開しているポートのlistener(1接続につき1つまで)
 	forwardAddr string       // クライアントがtcpip-forwardで要求した元のアドレス文字列(空文字含む)
+	users       *UserStore   // 使用量記録用
 	mu          sync.Mutex
 }
 
@@ -416,7 +480,7 @@ func handleConn(nConn net.Conn, sshConfig *ssh.ServerConfig, users *UserStore) {
 	username := sconn.Permissions.Extensions["username"]
 	log.Printf("接続: user=%s remote=%s", username, sconn.RemoteAddr())
 
-	state := &connState{username: username, sconn: sconn}
+	state := &connState{username: username, sconn: sconn, users: users}
 
 	// クライアントからのチャンネル開設要求はすべて拒否する
 	// (このサーバーはリバースフォワード専用。session/direct-tcpip等は許可しない)
@@ -473,6 +537,14 @@ func handleTCPIPForward(state *connState, req *ssh.Request, users *UserStore) {
 	assignedPort, err := users.AssignedPort(state.username)
 	if err != nil {
 		log.Printf("ポート割当て失敗 user=%s: %v", state.username, err)
+		if req.WantReply {
+			req.Reply(false, nil)
+		}
+		return
+	}
+
+	if users.IsOverLimit(state.username) {
+		log.Printf("user=%s は無料枠の月間上限(1GB)に達しているためトンネルを拒否します", state.username)
 		if req.WantReply {
 			req.Reply(false, nil)
 		}
@@ -565,21 +637,27 @@ func bridgeConnection(state *connState, publicConn net.Conn, publicPort int) {
 	log.Printf("チャンネル開設成功: user=%s remote=%s", state.username, publicConn.RemoteAddr())
 
 	var wg sync.WaitGroup
+	var n1, n2 int64
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		n, err := io.Copy(ch, publicConn)
+		n1 = n
 		log.Printf("client->local: %d bytes, err=%v (user=%s)", n, err, state.username)
 		ch.CloseWrite()
 	}()
 	go func() {
 		defer wg.Done()
 		n, err := io.Copy(publicConn, ch)
+		n2 = n
 		log.Printf("local->client: %d bytes, err=%v (user=%s)", n, err, state.username)
 		if tcpConn, ok := publicConn.(*net.TCPConn); ok {
 			tcpConn.CloseWrite()
 		}
 	}()
 	wg.Wait()
+	if state.users != nil {
+		state.users.AddUsage(state.username, n1+n2)
+	}
 	log.Printf("ブリッジ終了: user=%s", state.username)
 }
